@@ -1153,6 +1153,9 @@ class TestScheduler(object):
         the TestStatus file, but there are a few cases where it has to.
         """
         test_dir = self._get_test_dir(test)
+
+        # Since we run a process pool (and not a thread pool), we do not have the GIL on,
+        # so we need to manually ensure the test status is not accessed concurrently
         lock_path = os.path.join(test_dir,"test_status.lock")
         lock = FileLock(os.path.join(test_dir,"test_status.lock"))
         with lock:
@@ -1232,7 +1235,11 @@ class TestScheduler(object):
             self._update_test_status(test, RUN_PHASE, TEST_PEND_STATUS)
             self._consumer(test, RUN_PHASE, self._run_phase)
 
-        return test_phase,status
+        # NOTE: we return final phase/status, cause we are running in a subprocess,
+        #       with a separate copy of all data. Hence, upon returning, we need the parent
+        #       process to make its copy of test data consistent with what it is here
+        final_phase, final_status = self._get_test_data(test)
+        return final_phase, final_status
 
     ###########################################################################
     def _producer(self):
@@ -1248,10 +1255,6 @@ class TestScheduler(object):
         #  'F': finished a test phase
         #  'D': done with all phases
         tests_status = { i : 'N' for i in self._tests }
-        tests_cpus = { i : [] for i in self._tests }
-        print ("total cpus: {}".format(num_total_cores))
-
-        iter = 0
 
         with futures.ProcessPoolExecutor(max_workers=num_total_cores) as executor:
             # Keep cycling over tests, until they are all marked as 'D' (done)
@@ -1269,19 +1272,19 @@ class TestScheduler(object):
                             # Release the cores used
                             # Note: do NOT continue unless this was last phase,
                             #       since we might start next phase for this test
-                            for p in tests_cpus[test]:
+                            for p in self._procs_list[test]:
                                 free_cpus[p] = True
                             tests_status[test] = 'F'
-                            self._update_test_status(test, f.result()[0], f.result()[1])
+
+                            # Make test status consistent with what it was in the subprocess
+                            self._tests[test] = (f.result()[0],f.result()[1])
                             del threads_in_flight[test]
                             self._procs_list[test] = []
 
-                            print ("{} finished!".format(test))
                             # If no more phases left, this test is done.
                             if not self._work_remains(test):
                                 num_tests_done += 1
                                 tests_status[test] = 'D'
-                                print ("{} is done!".format(test))
                                 continue
                         else:
                             # Test still running, go to the next one
@@ -1290,8 +1293,6 @@ class TestScheduler(object):
                     # Test either completed *some* phases (but not all) or has not yet started at all.
                     # Try to start next phase (if enough cpus are available)
                     test_phase, test_status = self._get_test_data(test)
-                    if test_status == TEST_PEND_STATUS:
-                        print ("status: {}".format(test_status))
                     expect(test_status != TEST_PEND_STATUS, test)
                     next_phase = self._phases[self._phases.index(test_phase) + 1]
                     procs_needed = self._get_procs_needed(
@@ -1370,7 +1371,6 @@ class TestScheduler(object):
                     logger.debug(
                         "    Total procs in use: {}".format(total_procs)
                     )
-        print ("done!")
 
     ###########################################################################
     def _setup_cs_files(self):
