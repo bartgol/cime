@@ -11,6 +11,9 @@ they can be run outside the context of TestScheduler.
 import os
 import traceback, stat, threading, time, glob
 from collections import OrderedDict
+import concurrent.futures as futures
+import psutil
+from filelock import FileLock
 
 from CIME.XML.standard_module_setup import *
 from CIME.get_tests import get_recommended_test_time, get_build_groups
@@ -462,6 +465,9 @@ class TestScheduler(object):
         # instead, errors will be placed in the TestStatus files for the various
         # tests cases
 
+        # A global dict to keep track of the processors currently assigned to a test
+        self._procs_list = { t : [] for t in self._tests}
+
     ###########################################################################
     def get_testnames(self):
         ###########################################################################
@@ -573,7 +579,7 @@ class TestScheduler(object):
         env["PYTHONPATH"] = f"{get_cime_root()}:{get_tools_path()}"
 
         while True:
-            rc, output, errput = run_cmd(cmd, from_dir=from_dir, env=env)
+            rc, output, errput = run_cmd(cmd, from_dir=from_dir, env=env, procs_list=self._procs_list[test])
             if rc != 0:
                 self._log_output(
                     test,
@@ -1128,7 +1134,7 @@ class TestScheduler(object):
                 # Will force serialization of sharedlib builds
                 # TODO - instead of serializing, compute all library configs needed and build
                 # them all in parallel
-                for _, _, running_phase in threads_in_flight.values():
+                for _, running_phase in threads_in_flight.values():
                     if running_phase == SHAREDLIB_BUILD_PHASE:
                         return self._proc_pool + 1
 
@@ -1140,23 +1146,6 @@ class TestScheduler(object):
             return 1
 
     ###########################################################################
-    def _wait_for_something_to_finish(self, threads_in_flight):
-        ###########################################################################
-        expect(len(threads_in_flight) <= self._parallel_jobs, "Oversubscribed?")
-        finished_tests = []
-        while not finished_tests:
-            for test, thread_info in threads_in_flight.items():
-                if not thread_info[0].is_alive():
-                    finished_tests.append((test, thread_info[1]))
-
-            if not finished_tests:
-                time.sleep(0.2)
-
-        for finished_test, procs_needed in finished_tests:
-            self._procs_avail += procs_needed
-            del threads_in_flight[finished_test]
-
-    ###########################################################################
     def _update_test_status_file(self, test, test_phase, status):
         ###########################################################################
         """
@@ -1164,8 +1153,11 @@ class TestScheduler(object):
         the TestStatus file, but there are a few cases where it has to.
         """
         test_dir = self._get_test_dir(test)
-        with TestStatus(test_dir=test_dir, test_name=test) as ts:
-            ts.set_status(test_phase, status)
+        lock_path = os.path.join(test_dir,"test_status.lock")
+        lock = FileLock(os.path.join(test_dir,"test_status.lock"))
+        with lock:
+            with TestStatus(test_dir=test_dir, test_name=test) as ts:
+                ts.set_status(test_phase, status)
 
     ###########################################################################
     def _consumer(self, test, test_phase, phase_method):
@@ -1240,108 +1232,145 @@ class TestScheduler(object):
             self._update_test_status(test, RUN_PHASE, TEST_PEND_STATUS)
             self._consumer(test, RUN_PHASE, self._run_phase)
 
+        return test_phase,status
+
     ###########################################################################
     def _producer(self):
         ###########################################################################
-        threads_in_flight = {}  # test-name -> (thread, procs, phase)
-        while True:
-            work_to_do = False
-            num_threads_launched_this_iteration = 0
-            for test in self._tests:
-                logger.debug("test_name: " + test)
 
-                if self._work_remains(test):
-                    work_to_do = True
+        num_total_cores = psutil.cpu_count(logical=False)
+        free_cpus = [True for i in range(1,num_total_cores+1)]
+        threads_in_flight = {}  # test-name -> (future, num_procs, phase)
+        num_tests_done = 0
+        # Test status:
+        #  'N': not started at all
+        #  'R': running a test phase
+        #  'F': finished a test phase
+        #  'D': done with all phases
+        tests_status = { i : 'N' for i in self._tests }
+        tests_cpus = { i : [] for i in self._tests }
+        print ("total cpus: {}".format(num_total_cores))
 
-                    # If we have no workers available, immediately break out of loop so we can wait
-                    if len(threads_in_flight) == self._parallel_jobs:
-                        break
+        iter = 0
 
-                    if test not in threads_in_flight:
-                        test_phase, test_status = self._get_test_data(test)
-                        expect(test_status != TEST_PEND_STATUS, test)
-                        next_phase = self._phases[self._phases.index(test_phase) + 1]
-                        procs_needed = self._get_procs_needed(
-                            test, next_phase, threads_in_flight
-                        )
+        with futures.ProcessPoolExecutor(max_workers=num_total_cores) as executor:
+            # Keep cycling over tests, until they are all marked as 'D' (done)
+            while num_tests_done < len(self._tests):
+                for test in self._tests:
+                    logger.debug("test_name: " + test)
 
-                        if procs_needed <= self._procs_avail:
-                            self._procs_avail -= procs_needed
+                    if tests_status[test]=='D':
+                        continue
 
-                            # Necessary to print this way when multiple threads printing
-                            logger.info(
-                                "Starting {} for test {} with {:d} procs".format(
-                                    next_phase, test, procs_needed
-                                )
-                            )
+                    if tests_status[test]=='R':
+                        # Check if current phase completed. If so, update status and available resources
+                        f = threads_in_flight[test][0]
+                        if f.done():
+                            # Release the cores used
+                            # Note: do NOT continue unless this was last phase,
+                            #       since we might start next phase for this test
+                            for p in tests_cpus[test]:
+                                free_cpus[p] = True
+                            tests_status[test] = 'F'
+                            self._update_test_status(test, f.result()[0], f.result()[1])
+                            del threads_in_flight[test]
+                            self._procs_list[test] = []
 
-                            self._update_test_status(test, next_phase, TEST_PEND_STATUS)
-                            new_thread = threading.Thread(
-                                target=self._consumer,
-                                args=(
-                                    test,
-                                    next_phase,
-                                    getattr(
-                                        self, "_{}_phase".format(next_phase.lower())
-                                    ),
-                                ),
-                            )
-                            threads_in_flight[test] = (
-                                new_thread,
-                                procs_needed,
-                                next_phase,
-                            )
-                            new_thread.start()
-                            num_threads_launched_this_iteration += 1
-
-                            logger.debug("  Current workload:")
-                            total_procs = 0
-                            for the_test, the_data in threads_in_flight.items():
-                                logger.debug(
-                                    "    {}: {} -> {}".format(
-                                        the_test, the_data[2], the_data[1]
-                                    )
-                                )
-                                total_procs += the_data[1]
-
-                            logger.debug(
-                                "    Total procs in use: {}".format(total_procs)
-                            )
+                            print ("{} finished!".format(test))
+                            # If no more phases left, this test is done.
+                            if not self._work_remains(test):
+                                num_tests_done += 1
+                                tests_status[test] = 'D'
+                                print ("{} is done!".format(test))
+                                continue
                         else:
-                            if not threads_in_flight:
-                                msg = "Phase '{}' for test '{}' required more processors, {:d}, than this machine can provide, {:d}".format(
-                                    next_phase, test, procs_needed, self._procs_avail
+                            # Test still running, go to the next one
+                            continue
+
+                    # Test either completed *some* phases (but not all) or has not yet started at all.
+                    # Try to start next phase (if enough cpus are available)
+                    test_phase, test_status = self._get_test_data(test)
+                    if test_status == TEST_PEND_STATUS:
+                        print ("status: {}".format(test_status))
+                    expect(test_status != TEST_PEND_STATUS, test)
+                    next_phase = self._phases[self._phases.index(test_phase) + 1]
+                    procs_needed = self._get_procs_needed(
+                        test, next_phase, threads_in_flight
+                    )
+                    num_avail_cpus = sum(free_cpus)
+                    if num_avail_cpus<procs_needed:
+                        # Can't run this test yet. But if nothing was running, this test cannot run
+                        if not threads_in_flight:
+                            msg = "Phase '{}' for test '{}' required more processors, {:d}, than this machine can provide, {:d}".format(
+                                next_phase, test, procs_needed, self._procs_avail
+                            )
+                            logger.warning(msg)
+                            self._update_test_status(
+                                test, next_phase, TEST_PEND_STATUS
+                            )
+                            self._update_test_status(
+                                test, next_phase, TEST_FAIL_STATUS
+                            )
+                            self._log_output(test, msg)
+                            if next_phase == RUN_PHASE:
+                                self._update_test_status_file(
+                                    test, SUBMIT_PHASE, TEST_PASS_STATUS
                                 )
-                                logger.warning(msg)
-                                self._update_test_status(
-                                    test, next_phase, TEST_PEND_STATUS
-                                )
-                                self._update_test_status(
+                                self._update_test_status_file(
                                     test, next_phase, TEST_FAIL_STATUS
                                 )
-                                self._log_output(test, msg)
-                                if next_phase == RUN_PHASE:
-                                    self._update_test_status_file(
-                                        test, SUBMIT_PHASE, TEST_PASS_STATUS
-                                    )
-                                    self._update_test_status_file(
-                                        test, next_phase, TEST_FAIL_STATUS
-                                    )
-                                else:
-                                    self._update_test_status_file(
-                                        test, next_phase, TEST_FAIL_STATUS
-                                    )
-                                num_threads_launched_this_iteration += 1
+                            else:
+                                self._update_test_status_file(
+                                    test, next_phase, TEST_FAIL_STATUS
+                                )
+                        continue
 
-            if not work_to_do:
-                break
+                    # Got enough cpus. Get first $procs_needed free cpus
+                    for i,p in enumerate(free_cpus):
+                        if p:
+                            free_cpus[i] = False
+                            self._procs_list[test].append(i)
+                        if len(self._procs_list[test])==procs_needed:
+                            break
 
-            if num_threads_launched_this_iteration == 0:
-                # No free resources, wait for something in flight to finish
-                self._wait_for_something_to_finish(threads_in_flight)
+                    # Ok, dispatch new job
+                    logger.info(
+                        "Starting {} for test {} with {:d} procs, running on cpus [{}]".format(
+                            next_phase, test, procs_needed, ",".join(str(i) for i in self._procs_list[test])
+                        )
+                    )
+                    test_future = executor.submit(
+                            self._consumer,
+                            test,
+                            next_phase,
+                            getattr(
+                                self, "_{}_phase".format(next_phase.lower())
+                            )
+                    )
+                    tests_status[test] = 'R'
+                    self._update_test_status(test, next_phase, TEST_PEND_STATUS)
 
-        for unfinished_thread, _, _ in threads_in_flight.values():
-            unfinished_thread.join()
+                    threads_in_flight[test] = (
+                        test_future,
+                        procs_needed,
+                        next_phase,
+                    )
+
+                    logger.debug("  Current workload:")
+
+                    total_procs = 0
+                    for the_test, the_data in threads_in_flight.items():
+                        logger.debug(
+                            "    {}: {} -> {}".format(
+                                the_test, the_data[2], the_data[1]
+                            )
+                        )
+                        total_procs += the_data[1]
+
+                    logger.debug(
+                        "    Total procs in use: {}".format(total_procs)
+                    )
+        print ("done!")
 
     ###########################################################################
     def _setup_cs_files(self):
