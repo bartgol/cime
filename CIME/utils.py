@@ -8,6 +8,7 @@ import importlib.util
 import errno, signal, warnings, filecmp
 import stat as statlib
 from contextlib import contextmanager
+import psutil
 
 from distutils import file_util
 
@@ -753,6 +754,7 @@ def run_cmd(
     combine_output=False,
     timeout=None,
     executable=None,
+    procs_list=None,
 ):
     """
     Wrapper around subprocess to make it much more convenient to run shell commands
@@ -820,6 +822,8 @@ def run_cmd(
                 executable=executable,
                 env=env,
             )
+            if (procs_list):
+                psutil.Process(proc.pid).cpu_affinity(procs_list)
 
             output, errput = proc.communicate(input_str)
     else:
@@ -833,6 +837,8 @@ def run_cmd(
             executable=executable,
             env=env,
         )
+        if (procs_list):
+            psutil.Process(proc.pid).cpu_affinity(procs_list)
 
         output, errput = proc.communicate(input_str)
 
