@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+
+import argparse, pathlib, os, sys, subprocess
+from mpi4py import MPI
+
+###############################################################################
+def expect(condition, error_msg, exc_type=SystemExit, error_prefix="ERROR:"):
+###############################################################################
+    """
+    Similar to assert except doesn't generate an ugly stacktrace. Useful for
+    checking user error, not programming error.
+
+    >>> expect(True, "error1")
+    >>> expect(False, "error2")
+    Traceback (most recent call last):
+        ...
+    SystemExit: ERROR: error2
+    """
+    if not condition:
+        msg = error_prefix + " " + error_msg
+        raise exc_type(msg)
+
+###############################################################################
+def run_cmd(cmd, env, verbose):
+###############################################################################
+
+    if verbose:
+        print("RUN: {}\nFROM: {}".format(cmd, os.getcwd()))
+
+    proc = subprocess.Popen(cmd,
+                            shell=True,
+                            stdout=None,
+                            stderr=None,
+                            env=env)
+
+    stat = proc.wait()
+
+    return stat
+
+###############################################################################
+def parse_command_line(args, description):
+###############################################################################
+    parser = argparse.ArgumentParser(
+        usage="""\n{0} -- <executable> [<exe-args>]
+OR
+{0} --help
+
+\033[1mEXAMPLES:\033[0m
+    \033[1;32m# Lightweight python wrapper for a test that handles thread binding.\033[0m
+    > {0} -- ./my_exec
+
+""".format(pathlib.Path(args[0]).name),
+        description=description,
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+    )
+    parser.add_argument("-c","--cpu-set", type=str)
+    parser.add_argument("-v","--verbose", help="Print command run and directiry",action="store_true")
+
+    return parser.parse_known_args(args[1:])
+
+###############################################################################
+def run_exec(cpu_set=None,verbose=False,exec_args=[]):
+###############################################################################
+
+    expect(len(exec_args) >= 1,
+           "Expected exec_args='<exe> [<exe-args>], got: {}".format(exec_args))
+
+    exec_name = exec_args.pop(0);
+    args = " ".join(exec_args)
+    invoke = exec_name + " " + args
+
+    env = os.environ
+    if cpu_set is None:
+        stat = run_cmd(invoke,env,verbose=verbose)
+    else:
+        local_comm = MPI.COMM_WORLD.Split_type(MPI.COMM_TYPE_SHARED)
+
+        size = local_comm.Get_size()
+        rank = local_comm.Get_rank()
+        omp = 1
+        if "OMP_NUM_THREADS" in env.keys():
+            omp = int(env["OMP_NUM_THREADS"])
+
+        cpu_list_pre = [i.strip() for i in cpu_set.split(',')]
+        cpu_list = []
+        for entry in cpu_list_pre:
+            if entry.isdigit():
+                cpu_list.append(entry)
+            else:
+                tokens = entry.split('-')
+                expect (len(tokens)==2, "Invalid entry in cpu set '{}'".format(entry))
+                expect (tokens[0].isdigit() and tokens[1].isdigit(),
+                        "Invalid cpu range '{}'".format(entry))
+                for i in range(int(tokens[0]), int(tokens[1])+1):
+                    cpu_list.append(str(i))
+
+        expect (len(cpu_list)>=size*omp,
+                "Error! cpu list cannot accommodate all ranks/threads.")
+
+        my_offset = rank*omp
+        my_cpus = cpu_list[my_offset:my_offset+omp]
+
+        cmd = "taskset -c " + ",".join(my_cpus) + " " + invoke
+        stat = run_cmd(cmd,env,verbose=verbose)
+
+    return stat==0
+
+###############################################################################
+def _main_func(description):
+###############################################################################
+    options, rest = parse_command_line(sys.argv, description)
+    success = run_exec(**vars(options), exec_args=rest)
+
+    sys.exit(0 if success else 1)
+
+###############################################################################
+
+if (__name__ == "__main__"):
+    _main_func(__doc__)
