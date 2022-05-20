@@ -1002,9 +1002,11 @@ class TestScheduler(object):
 
 
         # Add sym link to mpi launcher, which is not a default tool that CIME links to caseroot
-        mpi_launcher = os.path.join(self._cime_root,"CIME","Tools","mpi_launcher")
-        destfile = os.path.join(self._get_test_dir(test), os.path.basename("mpi_launcher"))
-        os.symlink(mpi_launcher, destfile)
+        with Case(case_root=self._get_test_dir(test),read_only=False) as case:
+            rundir = case.get_value("RUNDIR")
+            mpi_launcher = os.path.join(self._cime_root,"CIME","Tools","mpi_launcher")
+            destfile = os.path.join(rundir, os.path.basename("mpi_launcher"))
+            os.symlink(mpi_launcher, destfile)
 
         return rv
 
@@ -1083,10 +1085,10 @@ class TestScheduler(object):
 
             return True, "SKIPPED"
         else:
-            with Case(read_only=False) as case:
+            with Case(case_root=self._get_test_dir(test),read_only=False) as case:
                 cpu_list = ",".join([str(i) for i in self._procs_list[test]])
-                exe = case.get_value(run_exe)
-                case.set_value("./mpi_launcher -c {} {}".format(cpu_list,exe))
+                exe = case.get_value("run_exe")
+                case.set_value("run_exe","$RUNDIR/mpi_launcher -c {} {}".format(cpu_list,exe))
 
             cmd = "./case.submit"
             if not self._allow_pnl:
