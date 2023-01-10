@@ -251,6 +251,10 @@ def get_standard_cmake_args(case, sharedpath, shared_lib=False):
 
     if not shared_lib:
         cmake_args += " -DUSE_KOKKOS={} ".format(stringify_bool(uses_kokkos(case)))
+        installed_kokkos_dir = os.environ.get("KOKKOS_PATH")
+        if installed_kokkos_dir is not None:
+           # We are trying to use a pre-installed kokkos. Set the CMake var with its path
+           cmake_args += " -DKOKKOS_PATH={}".format(installed_kokkos_dir)
         comps = _get_compset_comps(case)
         cmake_args += " -DCOMP_NAMES='{}' ".format(";".join(comps))
 
